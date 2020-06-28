@@ -197,16 +197,20 @@ static int try_read_sensor(void)
 	mdelay(20);  /* Read cycle takes less than 6ms. */
 
 	if (sensor_state.num_edges != DHT22_MAX_TIMESTAMPS) {
+#ifdef DHT22_DEBUG
 		printk(KERN_ERR DHT22_MODULE_NAME
 		       ": only detected %d bits\n",
 		       sensor_state.num_edges);
+#endif
 		return -EIO;
 	}
 	sum = sensor_state.bytes[0] + sensor_state.bytes[1] +
 	  sensor_state.bytes[2] + sensor_state.bytes[3];
 	if (sum != sensor_state.bytes[4]) {
+#ifdef DHT22_DEBUG
 		printk(KERN_ERR DHT22_MODULE_NAME
 		       ": sensor checksum mismatch\n");
+#endif
 		return -EIO;
 	}
 
@@ -324,7 +328,7 @@ static int device_open(struct inode *inode, struct file *filp)
 		goto unlock_and_return;
 	}
 	if (ktime_to_ms(ktime_get() - sensor_state.read_timestamp)
-	    > 10000 * read_delay_sec) {
+	    > 3100 * read_delay_sec) {
 		printk(KERN_ERR DHT22_MODULE_NAME
 		       ": too many recent read errors\n");
 		error = -EIO;
