@@ -117,7 +117,7 @@ static DEFINE_MUTEX(sensor_mutex);  /* Protects sensor_state. */
 static irqreturn_t s_handle_edge(int irq, void *dev_id)
 {
 	ktime_t now, last;
-	int width;
+	s64 width;
 	unsigned long flags;
 	local_irq_save(flags);
 	if (sensor_state.num_edges <= 0) goto irq_handled;
@@ -126,7 +126,7 @@ static irqreturn_t s_handle_edge(int irq, void *dev_id)
 	last = sensor_state.timestamps[sensor_state.num_edges - 1];
 	width = ktime_to_us(now - last);
 	/* Start storing timestamps after the long start pulse happened. */
-	if (sensor_state.num_edges == 1 && width < 1000) goto irq_handled;
+	if (sensor_state.num_edges == 1 && width < 500) goto irq_handled;
 	sensor_state.timestamps[sensor_state.num_edges++] = now;
 	/*
 	 * The first falling edge that is the end of a tramsitted bit occurs
