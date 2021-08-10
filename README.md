@@ -11,7 +11,7 @@ To build the kernel module, you need to first install the following
 packages:
 
 ```
-sudo apt install build-essentials raspberrypi-kernel-headers
+sudo apt install build-essential raspberrypi-kernel-headers
 ```
 
 To learn more about Linux device drivers, see [Linux Device Drivers, Third
