@@ -16,15 +16,14 @@
 #include <linux/err.h>
 #include <linux/fs.h>
 #include <linux/gpio.h>
-#include <linux/hrtimer.h>
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
-#include <linux/mutex.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+#include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/time64.h>
 #include <linux/types.h>
@@ -84,10 +83,10 @@ struct dht22_state {
 
 /*
  * sensor_state is an instance of struct dht22_state.
- * It may only be accessed when holding sensor_mutex.
+ * It may only be accessed when holding sensor_lock.
  */
 static struct dht22_state sensor_state;
-static DEFINE_MUTEX(sensor_mutex);  /* Protects sensor_state. */
+static DEFINE_SPINLOCK(sensor_lock);  /* Protects sensor_state. */
 
 /*
  * We set up an interrupt to trigger a falling edge (high to low) on the
@@ -119,7 +118,7 @@ static irqreturn_t s_handle_edge(int irq, void *dev_id)
 	ktime_t now, last;
 	s64 width;
 	unsigned long flags;
-	local_irq_save(flags);
+	spin_lock_irqsave(&sensor_lock, flags);
 	if (sensor_state.num_edges <= 0) goto irq_handled;
 	if (sensor_state.num_edges >= DHT22_MAX_TIMESTAMPS) goto irq_handled;
 	now = ktime_get();
@@ -141,46 +140,40 @@ static irqreturn_t s_handle_edge(int irq, void *dev_id)
 		sensor_state.bytes[byte_index] |= 1 << bit_index;
 	}
  irq_handled:
-	local_irq_restore(flags);
+	spin_unlock_irqrestore(&sensor_lock, flags);
 	return IRQ_HANDLED;
 }
 
 /*
  * try_read_sensor() - try reading data from the DHT22 sensor.
  *
- * The DHT22 sensor can be read at most once every two seconds, so if the
- * sensor has recently been read we simply keep the old reading and return.
- *
- * Otherwise, we tell the sensor that we want to execute a new sensor read.
  * The protocol for starting a sensor read is to first pull the GPIO pin
  * low for at least 1ms (we pull it low for 1.5ms) and then pull the pin
  * high and wait for the sensor to respond with an 80µs low pulse followed
  * by an 80µs high pulse. After that initial response, the sensor sends 40
  * pulses whose widths encode the actual sensor data. The pulses are
  * recorded by our interrupt handler; we simply wait for 10ms so that the
- * read cycle finishes and then process the data in sensor_state.
+ * read cycle finishes and then process the data in sensor_state. The
+ * pulses are collected by an interrupt on falling edge on the GPIO pin.
  *
- * Once the sensor data has been read, we check that the right number of
- * bits have been read and that the checksum is correct. If those checks
- * pass, we update read_timestamp, humidity and temperature fields in
- * sensor_state with the newly read data.
- *
- * Context: May only be called when holding sensor_mutex.
- * Return: 0 on success; -EIO on error.
+ * Return: 0 on success; -EBUSY or -EIO on error.
  */
 static int try_read_sensor(void)
 {
-	ktime_t new_timestamp = ktime_get();
-	s64 timestamp_diff =
-		ktime_to_ms(new_timestamp - sensor_state.read_timestamp);
-	u8 sum;
+	const ktime_t now = ktime_get();
+	s64 timestamp_diff;
+	unsigned long flags;
+	spin_lock_irqsave(&sensor_lock, flags);
+	timestamp_diff = ktime_to_ms(now - sensor_state.read_timestamp);
 	if (timestamp_diff < 2000) {
+		spin_unlock_irqrestore(&sensor_lock, flags);
 		printk(KERN_ERR DHT22_MODULE_NAME ": sensor read too soon\n");
 		return -EBUSY;
 	}
-	sensor_state.timestamps[0] = new_timestamp;
+	sensor_state.timestamps[0] = now;
 	sensor_state.num_edges = 1;
 	memset(sensor_state.bytes, 0, sizeof sensor_state.bytes);
+	spin_unlock_irqrestore(&sensor_lock, flags);
 
 	if (gpio_direction_output(gpiopin, 0)) {
 		printk(KERN_ERR DHT22_MODULE_NAME
@@ -194,24 +187,33 @@ static int try_read_sensor(void)
 		       ": gpio_direction_input failed\n");
 		return -EIO;
 	}
-	mdelay(20);  /* Read cycle takes less than 6ms. */
+	return 0;
+}
 
+/*
+ * try_parse_sensor() - try parsing data read from the DHT22 sensor.
+ *
+ * Check that the right number of bits have been read and that the checksum is
+ * correct. If those checks pass, update read_timestamp, humidity and
+ * temperature fields in sensor_state with the newly read data.
+ *
+ * Return: 0 on success; -EIO on error.
+ */
+static int try_parse_sensor(void)
+{
+	int error = 0;
+	u8 sum;
+	unsigned long flags;
+	spin_lock_irqsave(&sensor_lock, flags);
 	if (sensor_state.num_edges != DHT22_MAX_TIMESTAMPS) {
-#ifdef DHT22_DEBUG
-		printk(KERN_ERR DHT22_MODULE_NAME
-		       ": only detected %d bits\n",
-		       sensor_state.num_edges);
-#endif
-		return -EIO;
+		error = -EIO;
+		goto end_try_parse;
 	}
-	sum = sensor_state.bytes[0] + sensor_state.bytes[1] +
-	  sensor_state.bytes[2] + sensor_state.bytes[3];
+	sum = (sensor_state.bytes[0] + sensor_state.bytes[1] +
+	       sensor_state.bytes[2] + sensor_state.bytes[3]);
 	if (sum != sensor_state.bytes[4]) {
-#ifdef DHT22_DEBUG
-		printk(KERN_ERR DHT22_MODULE_NAME
-		       ": sensor checksum mismatch\n");
-#endif
-		return -EIO;
+		error = -EIO;
+		goto end_try_parse;
 	}
 
 	ktime_get_real_ts64(&sensor_state.read_timespec);
@@ -224,7 +226,9 @@ static int try_read_sensor(void)
 	if (sensor_state.bytes[2] & 0x80) {
 		sensor_state.temperature = -sensor_state.temperature;
 	}
-	return 0;
+end_try_parse:
+	spin_unlock_irqrestore(&sensor_lock, flags);
+	return error;
 }
 
 #ifdef DHT22_DEBUG
@@ -234,15 +238,13 @@ static int try_read_sensor(void)
  * information to the kernel log.
  *
  * print_debug_info() prints sensor_state to kernel log.
- *
- * Context: May only be called when holding sensor_mutex.
  */
 static void print_debug_info(void)
 {
 	int i;
 	ktime_t last, first, now;
-	u8 sum;
-	printk(KERN_DEBUG DHT22_MODULE_NAME ": using gpio pin %d\n", gpiopin);
+	unsigned long flags;
+	spin_lock_irqsave(&sensor_lock, flags);
 	printk(KERN_DEBUG DHT22_MODULE_NAME ": detected %d edges\n",
 	       sensor_state.num_edges);
 	first = last = sensor_state.timestamps[0];
@@ -250,41 +252,40 @@ static void print_debug_info(void)
 		now = sensor_state.timestamps[i];
 		if (i < 3) {
 			printk(KERN_DEBUG DHT22_MODULE_NAME
-			       ": pulse[%2d]  == %5lldµs\n",
+			       ": pulse[%2d] ==%5lldµs\n",
 			       i, ktime_to_us(now - last));
 		} else {
 			printk(KERN_DEBUG DHT22_MODULE_NAME
-			       ": pulse[%2d]  == %5lldµs  ==>  %1d\n",
+			       ": pulse[%2d] ==%5lldµs  ==>  %1d\n",
 			       i, ktime_to_us(now - last),
 			       ktime_to_us(now - last) > DHT22_PULSE_BOUNDARY
 			       ? 1 : 0);
 		}
 		last = now;
 	}
-	if (sensor_state.num_edges != DHT22_MAX_TIMESTAMPS) {
-		return;
+	if (sensor_state.num_edges == DHT22_MAX_TIMESTAMPS) {
+		u8* b = sensor_state.bytes;
+		u8 sum = b[0] + b[1] + b[2] + b[3];
+		int hum = b[0] * 256 + b[1];
+		int temp = (b[2] & 0x7F) * 256 + b[3];
+		if (b[2] & 0x80) temp = -temp;
+		printk(KERN_DEBUG DHT22_MODULE_NAME ": duration%5lldµs\n",
+		       ktime_to_us(last - first));
+		printk(KERN_DEBUG DHT22_MODULE_NAME ": read bytes %*phC\n",
+		       5, b);
+		if (sum != b[4]) {
+			printk(KERN_DEBUG DHT22_MODULE_NAME
+			       ": checksum NOT ok: %x != %x\n",
+			       sum, b[4]);
+			return;
+		}
+		printk(KERN_DEBUG DHT22_MODULE_NAME ": checksum ok\n");
+		printk(KERN_DEBUG DHT22_MODULE_NAME ": humidity%3d.%d%%\n",
+		       hum / 10, hum % 10);
+		printk(KERN_DEBUG DHT22_MODULE_NAME ": temperature%3d.%d°C\n",
+		       temp / 10, temp % 10);
 	}
-	sum = sensor_state.bytes[0] + sensor_state.bytes[1] +
-	  sensor_state.bytes[2] + sensor_state.bytes[3];
-	printk(KERN_DEBUG DHT22_MODULE_NAME ": duration   == %5lldµs\n",
-	       ktime_to_us(last - first));
-	printk(KERN_DEBUG DHT22_MODULE_NAME ": read bytes ==  %*phC\n",
-	       5, sensor_state.bytes);
-	if (sum != sensor_state.bytes[4]) {
-		printk(KERN_DEBUG DHT22_MODULE_NAME
-		       ": checksum NOT ok: %x != %x\n",
-		       sum, sensor_state.bytes[4]);
-		return;
-	}
-	printk(KERN_DEBUG DHT22_MODULE_NAME ": checksum ok\n");
-	printk(KERN_DEBUG DHT22_MODULE_NAME ": humidity ==%3d.%d%%\n",
-	       sensor_state.humidity / 10, sensor_state.humidity % 10);
-	printk(KERN_DEBUG DHT22_MODULE_NAME ": temperature ==%3d.%d°C\n",
-	       sensor_state.temperature / 10, sensor_state.temperature % 10);
-	printk(KERN_DEBUG DHT22_MODULE_NAME ": ktime_get() == %lldns\n",
-	       sensor_state.read_timestamp);
-	printk(KERN_DEBUG DHT22_MODULE_NAME ": timeofday == %llds\n",
-	       sensor_state.read_timespec.tv_sec);
+	spin_unlock_irqrestore(&sensor_lock, flags);
 }
 #endif
 
@@ -310,8 +311,8 @@ struct dht22_output {
 /*
  * device_open() - called when a process opens our device.
  *
- * Fail if the sensor has not been read at all or if the last 10 attempts
- * to read the sensor failed.
+ * Attempt to read data from the sensor. Fail if the sensor has been read
+ * too recently or if the data cannot be read.
  *
  * Otherwise allocate a buffer for the text output and put a text
  * representation of the most recent sensor reading into the buffer.
@@ -320,45 +321,44 @@ struct dht22_output {
 static int device_open(struct inode *inode, struct file *filp)
 {
 	struct dht22_output* out;
+	time64_t seconds;
+	int hum_int, hum_frac, temp_int, temp_frac, printed;
+	unsigned long flags;
 	int error = 0;
-	mutex_lock(&sensor_mutex);
-	if (sensor_state.read_timespec.tv_sec == 0) {
-		printk(KERN_ERR DHT22_MODULE_NAME ": device not ready\n");
-		error = -EIO;
-		goto unlock_and_return;
+	if ((error = try_read_sensor()) != 0) {
+		return error;
 	}
-	if (ktime_to_ms(ktime_get() - sensor_state.read_timestamp)
-	    > 3100 * read_delay_sec) {
-		printk(KERN_ERR DHT22_MODULE_NAME
-		       ": too many recent read errors\n");
-		error = -EIO;
-		goto unlock_and_return;
+	msleep(20);  /* Read cycle takes less than 6ms. */
+#ifdef DHT22_DEBUG
+	print_debug_info();
+#endif
+	if ((error = try_parse_sensor()) != 0) {
+		return error;
 	}
 	out = kmalloc(sizeof(struct dht22_output),	GFP_KERNEL);
 	if (!out) {
 		printk(KERN_ALERT DHT22_MODULE_NAME
 		       ": no memory for chrdev buffer\n");
-		error = -ENOMEM;
-		goto unlock_and_return;
+		return -ENOMEM;
 	}
-	if(sizeof out->buf <= snprintf(out->buf, sizeof out->buf,
-				       "%lld,%d.%d,%d.%d\n",
-				       sensor_state.read_timespec.tv_sec,
-				       sensor_state.humidity / 10,
-				       sensor_state.humidity % 10,
-				       sensor_state.temperature / 10,
-				       sensor_state.temperature % 10)) {
+	spin_lock_irqsave(&sensor_lock, flags);
+	seconds = sensor_state.read_timespec.tv_sec;
+	hum_int = sensor_state.humidity / 10;
+	hum_frac = sensor_state.humidity % 10;
+	temp_int = sensor_state.temperature / 10;
+	temp_frac = sensor_state.temperature % 10;
+	spin_unlock_irqrestore(&sensor_lock, flags);
+	printed = snprintf(out->buf, sizeof out->buf, "%lld,%d.%d,%d.%d\n",
+			   seconds, hum_int, hum_frac, temp_int, temp_frac);
+	if(sizeof out->buf <= printed) {
 		kfree(out);
 		printk(KERN_ALERT DHT22_MODULE_NAME
 		       ": chrdev buffer overflow\n");
-		error = -ENOMEM;
-		goto unlock_and_return;
+		return -ENOMEM;
 	}
 	out->ptr = out->buf;
 	filp->private_data = out;
- unlock_and_return:
-	mutex_unlock(&sensor_mutex);
-	return error;
+	return 0;
 }
 
 /*
@@ -422,35 +422,12 @@ static struct device *dht22_device;
 
 
 
-/*
- * We use a hrtimer to trigger regular reads from the sensor.
- * The timer is configured when the kernel module is loaded.
- */
-
-static struct hrtimer timer;
-
-static enum hrtimer_restart hrtimer_handler(struct hrtimer *timer)
-{
-	ktime_t interval = ktime_set(read_delay_sec, 0);
-	mutex_lock(&sensor_mutex);
-	try_read_sensor();
-#ifdef DHT22_DEBUG
-	print_debug_info();
-#endif
-	mutex_unlock(&sensor_mutex);
-	hrtimer_forward(timer, ktime_get(), interval);
-	return HRTIMER_RESTART;
-}
-
-
-
 /**
  * m_init() - initialize the DHT22 module as it is loaded.
  *
  * Validate configuration parameters, connect to GPIO pin, initialize GPIO
  * pin to high, set up interrupt to trigger activity on the GPIO pin, create
- * character device used to pass human-readable data back to users, set up
- * timer that triggers sensor reads.
+ * character device used to pass human-readable data back to users.
  */
 int __init m_init(void)
 {
@@ -522,10 +499,6 @@ int __init m_init(void)
 		goto device_create_failed;
 	}
 
-	hrtimer_init(&timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	timer.function = hrtimer_handler;
-	hrtimer_start(&timer, ktime_set(initial_delay_sec, 0),
-		      HRTIMER_MODE_REL);
 	return 0;
 
 device_create_failed:
@@ -547,7 +520,6 @@ gpio_to_irq_failed:
  */
 void __exit m_cleanup(void)
 {
-	hrtimer_cancel(&timer);
 	device_destroy(dht22_class, dht22_dev_0);
 	class_destroy(dht22_class);
 	cdev_del(&dht22_cdev);
