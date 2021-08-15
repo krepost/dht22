@@ -34,9 +34,6 @@
 #define DHT22_NUM_DEVICES 1
 #define DHT22_MODULE_NAME "dht22"
 
-#define DHT22_MAX_TIMESTAMPS 43
-#define DHT22_PULSE_BOUNDARY 105
-
 /*
  * gpiopin module paramter configures which GPIO pin the module uses.
  */
@@ -73,7 +70,12 @@ struct dht22_state {
 	int irq;
 
 	int num_edges;
-	ktime_t timestamps[DHT22_MAX_TIMESTAMPS];
+	/*
+	 * timestamps[0] contains the start of the sensor read sequence.
+	 * The sensor initialization sequence generates two time stamps.
+	 * We then record 5*8 timestamps to get data for five bytes.
+	 */
+	ktime_t timestamps[1 + 2 + 5*8];
 	u8 bytes[5];
 
 	ktime_t read_timestamp;
@@ -83,24 +85,10 @@ struct dht22_state {
 };
 
 /*
- * sensor_state is an instance of struct dht22_state.
- * It may only be accessed when holding sensor_lock.
+ * sensor_state may only be accessed when holding sensor_lock.
  */
 static struct dht22_state sensor_state;
 static DEFINE_SPINLOCK(sensor_lock);  /* Protects sensor_state. */
-
-/*
- * We set up an interrupt to trigger a falling edge (high to low) on the
- * GPIO pin. During a sensor read, there are in total 43 falling edges:
- * three during the setup phase and then one for each transmitted bit of
- * information. The transmission of each bit starts with the signal going
- * low for 50 µs. Then signal goes high for 26 µs when 0 is transmitted;
- * signal goes high for 70 µs when 1 is transmitted. We count the time
- * between the falling edges and use 105µs as the boundary between reading
- * a 0 and reading a 1. The threshold is derived from measurements: the
- * long cycles are usually around 125µs while the short cycles vary between
- * 70µs and 95µs.
- */
 
 /*
  * s_handle_edge() - process interrupt due to falling edge on GPIO pin.
@@ -108,7 +96,15 @@ static DEFINE_SPINLOCK(sensor_lock);  /* Protects sensor_state. */
  * @dev_id: The device identifier. Unused.
  *
  * Records the timestamp of a falling edge (high to low) on the DHT22
- * sensor pin.
+ * sensor pin. Prior to the read sequence, sensor_state.timestamps[0]
+ * has already been set to the current timestamp and sensor_state.num_edges
+ * has been set to 1.
+ *
+ * During a sensor read, there are in total 42 falling edges: two during
+ * the setup phase and then one for each transmitted bit of information.
+ * The transmission of each bit starts with the signal going low for 50 µs.
+ * Then signal goes high for 26 µs when 0 is transmitted; signal goes high
+ * for 70 µs when 1 is transmitted.
  *
  * Return: IRQ_HANDLED
  */
@@ -118,13 +114,14 @@ static irqreturn_t s_handle_edge(int irq, void *dev_id)
 	unsigned long flags;
 	spin_lock_irqsave(&sensor_lock, flags);
 	if (sensor_state.num_edges <= 0) goto irq_handled;
-	if (sensor_state.num_edges >= DHT22_MAX_TIMESTAMPS) goto irq_handled;
 	/* Start storing timestamps after the long start pulse happened. */
 	if (sensor_state.num_edges == 1) {
 		s64 width = ktime_to_us(now - sensor_state.timestamps[0]);
 		if (width < 500) goto irq_handled;
 	}
-	sensor_state.timestamps[sensor_state.num_edges++] = now;
+	if (sensor_state.num_edges < sizeof sensor_state.timestamps) {
+		sensor_state.timestamps[sensor_state.num_edges++] = now;
+	}
  irq_handled:
 	spin_unlock_irqrestore(&sensor_lock, flags);
 	return IRQ_HANDLED;
@@ -144,26 +141,31 @@ static int __try_decode_pulses(void)
 {
 	int i;
 	u8 sum;
-	if (sensor_state.num_edges != DHT22_MAX_TIMESTAMPS) {
+	/*
+	 * The last falling edge which is the end of the start sequence occurs
+	 * at index 2 in the array of timestamps. Each falling edge after that
+	 * defines a pulse which encodes one bit.
+	 */
+	BUILD_BUG_ON(sizeof sensor_state.timestamps < 5*8+3);
+	BUILD_BUG_ON(sizeof sensor_state.bytes < 5);
+	if (sensor_state.num_edges < 5*8+3) {
 		return -EIO;
 	}
 	memset(sensor_state.bytes, 0, sizeof sensor_state.bytes);
-	/*
-	 * The first falling edge that is the end of a tramsitted bit occurs at
-	 * index 3 in the array of timestamps.
-	 */
-	BUILD_BUG_ON(sizeof sensor_state.timestamps < 5 * 8 + 3);
-	BUILD_BUG_ON(sizeof sensor_state.bytes < 5);
-	for (i = 0; i < 5 * 8; i++) {
-		ktime_t this = sensor_state.timestamps[i + 3];
-		ktime_t last = sensor_state.timestamps[i + 2];
-		s64 width = ktime_to_us(this - last);
+	for (i = 0; i < 5*8; i++) {
+		const ktime_t this = sensor_state.timestamps[i+3];
+		const ktime_t last = sensor_state.timestamps[i+2];
+		const s64 width = ktime_to_us(this - last);
 		/*
-		 * Since we zeroed out the bytes array before the loop, we only
-		 * have to update bytes when we read a 1 (encoded as a long
-		 * pulse) from the sensor.
+		 * Since we zeroed out the bytes array before the loop,
+		 * we only have to update bytes when we read a 1 (which
+		 * is encoded as a long pulse) from the sensor. We use 110µs
+		 * as the boundary between reading a 0 and reading a 1.
+		 * The threshold is derived from measurements: the long
+		 * cycles are usually around 125µs while the short cycles
+		 * vary between 70µs and 95µs.
 		 */
-		if (width > DHT22_PULSE_BOUNDARY) {
+		if (width > 110) {
 			sensor_state.bytes[i / 8] |= 1 << (7 - (i & 7));
 		}
 	}
@@ -198,7 +200,8 @@ static int try_read_sensor(void)
 	timestamp_diff = ktime_to_ms(now - sensor_state.read_timestamp);
 	if (timestamp_diff < 2000) {
 		spin_unlock_irqrestore(&sensor_lock, flags);
-		printk(KERN_NOTICE DHT22_MODULE_NAME ": sensor read too soon\n");
+		printk(KERN_NOTICE DHT22_MODULE_NAME
+		       ": sensor re-read too soon (within two seconds)\n");
 		return -EBUSY;
 	}
 	sensor_state.timestamps[0] = now;
@@ -206,14 +209,14 @@ static int try_read_sensor(void)
 	spin_unlock_irqrestore(&sensor_lock, flags);
 
 	if (gpio_direction_output(gpiopin, 0)) {
-		printk(KERN_ERR DHT22_MODULE_NAME
+		printk(KERN_ALERT DHT22_MODULE_NAME
 		       ": gpio_direction_output failed\n");
 		return -EIO;
 	}
 	udelay(1500);
 	gpio_set_value(gpiopin, 1);
 	if (gpio_direction_input(gpiopin)) {
-		printk(KERN_ERR DHT22_MODULE_NAME
+		printk(KERN_ALERT DHT22_MODULE_NAME
 		       ": gpio_direction_input failed\n");
 		return -EIO;
 	}
@@ -237,7 +240,7 @@ static int try_parse_sensor(void)
 	if ((error = __try_decode_pulses()) != 0) goto end_try_parse;
 	ktime_get_real_ts64(&sensor_state.read_timespec);
 	sensor_state.read_timestamp =
-		sensor_state.timestamps[DHT22_MAX_TIMESTAMPS - 1];
+		sensor_state.timestamps[sensor_state.num_edges - 1];
 	sensor_state.humidity =	(sensor_state.bytes[0] * 256 +
 				 sensor_state.bytes[1]);
 	sensor_state.temperature = ((sensor_state.bytes[2] & 0x7F) * 256 +
@@ -348,8 +351,8 @@ static int device_open(struct inode *inode, struct file *filp)
 	time64_t seconds;
 	int hum_int, hum_frac, temp_int, temp_frac, printed;
 	unsigned long flags;
-	int error = 0;
-	if ((error = try_read_sensor()) != 0) return error;
+	int error = try_read_sensor();
+	if (error != 0) return error;
 	msleep(20);  /* Read cycle takes less than 6ms. */
 #ifdef DHT22_DEBUG
 	print_timing_debug_info();
@@ -473,10 +476,12 @@ int __init m_init(void)
 	}
 	printk(KERN_INFO DHT22_MODULE_NAME ": GPIO pin %d\n", gpiopin);
 	if (gpio_direction_input(gpiopin)) {
-		printk(KERN_ERR DHT22_MODULE_NAME
+		printk(KERN_ALERT DHT22_MODULE_NAME
 		       ": initial gpio_direction_input failed\n");
 		return -ENODEV;
 	}
+	spin_lock(&sensor_lock);
+	sensor_state.read_timestamp = ktime_get();
 	sensor_state.irq = gpio_to_irq(gpiopin);
 	if (sensor_state.irq < 0) {
 		printk(KERN_ALERT DHT22_MODULE_NAME ": gpio_to_irq failed\n");
@@ -523,6 +528,7 @@ int __init m_init(void)
 		goto device_create_failed;
 	}
 
+	spin_unlock(&sensor_lock);
 	return 0;
 
 device_create_failed:
@@ -536,6 +542,7 @@ alloc_chrdev_failed:
 request_irq_failed:
 gpio_to_irq_failed:
 	gpio_free(gpiopin);
+	spin_unlock(&sensor_lock);
 	return error;
 }
 
