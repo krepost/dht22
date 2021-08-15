@@ -48,39 +48,32 @@ sudo rmmod dht22.ko
 
 ## Implementation
 
-The module reads data from the sensor at regular intervals and keeps track
-of the most recently successfully read sensor data. A user can access that
-state through a character device mounted at `/dev/dht22`.
+The module reads data from the sensor when the user opens the `/dev/dht22`
+device. To have the device accessible by regular users, one must add the udev
+rules file `99-dht22.rules` to the directory `/etc/udev/rules.d/`.
 
-We use a timer to trigger regular reads from the sensor. The protocol for
-starting a sensor read is to first pull the GPIO pin low for at least 1ms
-and then pull the pin high and wait for the sensor to respond with an 80µs
-low pulse followed by an 80µs high pulse. After that initial response, the
-sensor sends 40 pulses whose widths encode the actual sensor data. The
-pulses are recorded by an interrupt handler; we simply wait for the read
-cycle to finish and then process the data that the interrupt handler
-gathered.
+Since the sensor, as per the datasheet, can only be read once every two seconds
+the kernel module returns -EBUSY if the user attempts to read the sensor too
+soon. If the sensor read fails for some reason—usually due to the checksum
+validation not passing—the kernel module returns -EIO.
 
-The interrupt handler triggers on a falling edge (high to low) on the
-GPIO pin. During a sensor read, there are in total 43 falling edges:
-three during the setup phase and then one for each transmitted bit of
-information. The transmission of each bit starts with the signal going
-low for 50 µs. Then signal goes high for 26 µs when 0 is transmitted;
-signal goes high for 70 µs when 1 is transmitted. We count the time
-between the falling edges and use 105µs as the boundary between reading
-a 0 and reading a 1. The threshold is derived from measurements: the
-long cycles are usually around 125µs while the short cycles vary between
-70µs and 95µs.
+A succesul read from the `/dev/dht22` device returns three comma-separated
+numbers: the timestamp of the most recent successful sensor read, the relative
+humidity as a percentage, and the temperature in degrees Celcius.
 
-Once the read cycle is complete, we check that the right number of bits have
-been read and that the checksum is correct. If those checks pass, we decode
-the read bits into humidity and temperature readings.
+The protocol for starting a sensor read is to first pull the GPIO pin low for
+at least 1ms and then pull the pin high and wait for the sensor to respond with
+an 80µs low pulse followed by an 80µs high pulse. After that initial response,
+the sensor sends 40 pulses whose widths encode the actual sensor data. The
+pulses are recorded by an interrupt handler; we simply wait for the read cycle
+to finish and then process the data that the interrupt handler gathered.
 
-To return the sensor-data in human-readable form to users, we set up a
-read-only character device and make it accessible at `/dev/dht22`. To have
-the device accessible by regular users, one must add the udev rules file
-`99-dht22.rules` to the directory `/etc/udev/rules.d/`.
-
-Reading from the device returns three comma-separated numbers: the
-timestamp of the most recent successful sensor read, the relative humidity
-as a percentage, and the temperature in degrees Celcius.
+The interrupt handler triggers on a falling edge (high to low) on the GPIO
+pin. During a sensor read, there are in total 42 falling edges: two during the
+setup phase and then one for each transmitted bit of information. The
+transmission of each bit starts with the signal going low for 50 µs. Then
+signal goes high for 26 µs when 0 is transmitted; signal goes high for 70 µs
+when 1 is transmitted. We count the time between the falling edges and use
+110µs as the boundary between reading a 0 and reading a 1. The threshold is
+derived from measurements: the long cycles are usually around 125µs while the
+short cycles vary between 70µs and 95µs.
