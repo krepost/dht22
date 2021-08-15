@@ -11,8 +11,9 @@
  * GNU General Public License for more details.
  */
 
-#include <linux/delay.h>
+#include <linux/bug.h>
 #include <linux/cdev.h>
+#include <linux/delay.h>
 #include <linux/err.h>
 #include <linux/fs.h>
 #include <linux/gpio.h>
@@ -106,42 +107,72 @@ static DEFINE_SPINLOCK(sensor_lock);  /* Protects sensor_state. */
  * @irq: Then IRQ number. Unused.
  * @dev_id: The device identifier. Unused.
  *
- * Records the time stamp of a falling edge (high to low) on the DHT22
- * sensor pin and fills in the corresponding bit in the bytes buffer. The
- * code assumes that the bytes buffer was zeroed out before starting the
- * sensor read.
+ * Records the timestamp of a falling edge (high to low) on the DHT22
+ * sensor pin.
  *
  * Return: IRQ_HANDLED
  */
 static irqreturn_t s_handle_edge(int irq, void *dev_id)
 {
-	ktime_t now, last;
-	s64 width;
+	const ktime_t now = ktime_get();
 	unsigned long flags;
 	spin_lock_irqsave(&sensor_lock, flags);
 	if (sensor_state.num_edges <= 0) goto irq_handled;
 	if (sensor_state.num_edges >= DHT22_MAX_TIMESTAMPS) goto irq_handled;
-	now = ktime_get();
-	last = sensor_state.timestamps[sensor_state.num_edges - 1];
-	width = ktime_to_us(now - last);
 	/* Start storing timestamps after the long start pulse happened. */
-	if (sensor_state.num_edges == 1 && width < 500) goto irq_handled;
-	sensor_state.timestamps[sensor_state.num_edges++] = now;
-	/*
-	 * The first falling edge that is the end of a tramsitted bit occurs
-	 * at index 3 in the array of time stamps. Since we zeroed out the
-	 * bytes array before starting the read, we only have to update bytes
-	 * when we read a 1 (encoded as a long pulse) from the sensor.
-	 */
-	if (sensor_state.num_edges >= 4 && width > DHT22_PULSE_BOUNDARY) {
-		int sequence_index = sensor_state.num_edges - 4;
-		int byte_index = sequence_index / 8;
-		int bit_index = 7 - (sequence_index & 7);
-		sensor_state.bytes[byte_index] |= 1 << bit_index;
+	if (sensor_state.num_edges == 1) {
+		s64 width = ktime_to_us(now - sensor_state.timestamps[0]);
+		if (width < 500) goto irq_handled;
 	}
+	sensor_state.timestamps[sensor_state.num_edges++] = now;
  irq_handled:
 	spin_unlock_irqrestore(&sensor_lock, flags);
 	return IRQ_HANDLED;
+}
+
+/*
+ * __try_decode_pulses() - decode pulse widths and validate checksum.
+ *
+ * May only be called when holding sensor_lock.
+ *
+ * Translates pulse widths into bit values; stores the result in sensor_state.
+ * Validates the checksum.
+ *
+ * Return: 0 on success; -EIO on input error.
+ */
+static int __try_decode_pulses(void)
+{
+	int i;
+	u8 sum;
+	if (sensor_state.num_edges != DHT22_MAX_TIMESTAMPS) {
+		return -EIO;
+	}
+	memset(sensor_state.bytes, 0, sizeof sensor_state.bytes);
+	/*
+	 * The first falling edge that is the end of a tramsitted bit occurs at
+	 * index 3 in the array of timestamps.
+	 */
+	BUILD_BUG_ON(sizeof sensor_state.timestamps < 5 * 8 + 3);
+	BUILD_BUG_ON(sizeof sensor_state.bytes < 5);
+	for (i = 0; i < 5 * 8; i++) {
+		ktime_t this = sensor_state.timestamps[i + 3];
+		ktime_t last = sensor_state.timestamps[i + 2];
+		s64 width = ktime_to_us(this - last);
+		/*
+		 * Since we zeroed out the bytes array before the loop, we only
+		 * have to update bytes when we read a 1 (encoded as a long
+		 * pulse) from the sensor.
+		 */
+		if (width > DHT22_PULSE_BOUNDARY) {
+			sensor_state.bytes[i / 8] |= 1 << (7 - (i & 7));
+		}
+	}
+	sum = (sensor_state.bytes[0] + sensor_state.bytes[1] +
+	       sensor_state.bytes[2] + sensor_state.bytes[3]);
+	if (sum != sensor_state.bytes[4]) {
+		return -EIO;
+	}
+	return 0;
 }
 
 /*
@@ -167,12 +198,11 @@ static int try_read_sensor(void)
 	timestamp_diff = ktime_to_ms(now - sensor_state.read_timestamp);
 	if (timestamp_diff < 2000) {
 		spin_unlock_irqrestore(&sensor_lock, flags);
-		printk(KERN_ERR DHT22_MODULE_NAME ": sensor read too soon\n");
+		printk(KERN_NOTICE DHT22_MODULE_NAME ": sensor read too soon\n");
 		return -EBUSY;
 	}
 	sensor_state.timestamps[0] = now;
 	sensor_state.num_edges = 1;
-	memset(sensor_state.bytes, 0, sizeof sensor_state.bytes);
 	spin_unlock_irqrestore(&sensor_lock, flags);
 
 	if (gpio_direction_output(gpiopin, 0)) {
@@ -202,20 +232,9 @@ static int try_read_sensor(void)
 static int try_parse_sensor(void)
 {
 	int error = 0;
-	u8 sum;
 	unsigned long flags;
 	spin_lock_irqsave(&sensor_lock, flags);
-	if (sensor_state.num_edges != DHT22_MAX_TIMESTAMPS) {
-		error = -EIO;
-		goto end_try_parse;
-	}
-	sum = (sensor_state.bytes[0] + sensor_state.bytes[1] +
-	       sensor_state.bytes[2] + sensor_state.bytes[3]);
-	if (sum != sensor_state.bytes[4]) {
-		error = -EIO;
-		goto end_try_parse;
-	}
-
+	if ((error = __try_decode_pulses()) != 0) goto end_try_parse;
 	ktime_get_real_ts64(&sensor_state.read_timespec);
 	sensor_state.read_timestamp =
 		sensor_state.timestamps[DHT22_MAX_TIMESTAMPS - 1];
@@ -234,12 +253,9 @@ end_try_parse:
 #ifdef DHT22_DEBUG
 
 /*
- * When compiled with -DDHT22_DEBUG, the module logs debug
- * information to the kernel log.
- *
- * print_debug_info() prints sensor_state to kernel log.
+ * print_timing_debug_info() - prints detected pulse widths to kernel log.
  */
-static void print_debug_info(void)
+static void print_timing_debug_info(void)
 {
 	int i;
 	ktime_t last, first, now;
@@ -263,28 +279,36 @@ static void print_debug_info(void)
 		}
 		last = now;
 	}
-	if (sensor_state.num_edges == DHT22_MAX_TIMESTAMPS) {
-		u8* b = sensor_state.bytes;
-		u8 sum = b[0] + b[1] + b[2] + b[3];
-		int hum = b[0] * 256 + b[1];
-		int temp = (b[2] & 0x7F) * 256 + b[3];
-		if (b[2] & 0x80) temp = -temp;
-		printk(KERN_DEBUG DHT22_MODULE_NAME ": duration%5lldµs\n",
-		       ktime_to_us(last - first));
-		printk(KERN_DEBUG DHT22_MODULE_NAME ": read bytes %*phC\n",
-		       5, b);
-		if (sum != b[4]) {
-			printk(KERN_DEBUG DHT22_MODULE_NAME
-			       ": checksum NOT ok: %x != %x\n",
-			       sum, b[4]);
-			return;
-		}
-		printk(KERN_DEBUG DHT22_MODULE_NAME ": checksum ok\n");
-		printk(KERN_DEBUG DHT22_MODULE_NAME ": humidity%3d.%d%%\n",
-		       hum / 10, hum % 10);
-		printk(KERN_DEBUG DHT22_MODULE_NAME ": temperature%3d.%d°C\n",
-		       temp / 10, temp % 10);
+	printk(KERN_DEBUG DHT22_MODULE_NAME ": duration%5lldµs\n",
+	       ktime_to_us(last - first));
+	spin_unlock_irqrestore(&sensor_lock, flags);
+}
+
+/*
+ * print_parsed_debug_info() - prints parsed sensor data to kernel log.
+ */
+static void print_parsed_debug_info(void)
+{
+	int hum, temp;
+	u8 sum, *b;
+	unsigned long flags;
+	spin_lock_irqsave(&sensor_lock, flags);
+	b = sensor_state.bytes;
+	printk(KERN_DEBUG DHT22_MODULE_NAME ": read bytes %*phC\n", 5, b);
+	sum = b[0] + b[1] + b[2] + b[3];
+	hum = b[0] * 256 + b[1];
+	temp = (b[2] & 0x7F) * 256 + b[3];
+	if (b[2] & 0x80) temp = -temp;
+	if (sum != b[4]) {
+		printk(KERN_DEBUG DHT22_MODULE_NAME
+		       ": checksum NOT ok: %x != %x\n", sum, b[4]);
+		return;
 	}
+	printk(KERN_DEBUG DHT22_MODULE_NAME ": checksum ok\n");
+	printk(KERN_DEBUG DHT22_MODULE_NAME ": humidity%3d.%d%%\n",
+	       hum / 10, hum % 10);
+	printk(KERN_DEBUG DHT22_MODULE_NAME ": temperature%3d.%d°C\n",
+	       temp / 10, temp % 10);
 	spin_unlock_irqrestore(&sensor_lock, flags);
 }
 #endif
@@ -325,17 +349,17 @@ static int device_open(struct inode *inode, struct file *filp)
 	int hum_int, hum_frac, temp_int, temp_frac, printed;
 	unsigned long flags;
 	int error = 0;
-	if ((error = try_read_sensor()) != 0) {
-		return error;
-	}
+	if ((error = try_read_sensor()) != 0) return error;
 	msleep(20);  /* Read cycle takes less than 6ms. */
 #ifdef DHT22_DEBUG
-	print_debug_info();
+	print_timing_debug_info();
 #endif
-	if ((error = try_parse_sensor()) != 0) {
-		return error;
-	}
-	out = kmalloc(sizeof(struct dht22_output),	GFP_KERNEL);
+	error = try_parse_sensor();
+#ifdef DHT22_DEBUG
+	print_parsed_debug_info();
+#endif
+	if (error != 0) return error;
+	out = kmalloc(sizeof(struct dht22_output), GFP_KERNEL);
 	if (!out) {
 		printk(KERN_ALERT DHT22_MODULE_NAME
 		       ": no memory for chrdev buffer\n");
