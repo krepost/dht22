@@ -17,7 +17,7 @@ sudo apt install build-essential raspberrypi-kernel-headers
 To learn more about Linux device drivers, see [Linux Device Drivers, Third
 Edition](https://lwn.net/Kernel/LDD3/). To learn more about Linux kernel
 modules in general, see [The Linux Kernel Module Programming
-Guide](https://www.tldp.org/LDP/lkmpg/2.6/). To learn more about the DHT22
+Guide](https://sysprog21.github.io/lkmpg/). To learn more about the DHT22
 sensor, see the [data sheet](http://www.electrodragon.com/w/AM2302).
 
 ## Building and testing
@@ -31,10 +31,14 @@ To load the module into the kernel, run:
 sudo insmod dht22.ko
 ```
 
-Once the module has loaded, you can examine the data read by the sensor
-by running `cat /dev/dht22`. That returns three values: the unix timestamp,
-the humidity, the temperature. To gather these values, say, every ten minutes,
-add the following like to crontab:
+Once the module has loaded, you can read sensor data by running
+`cat /dev/dht22`. To have the device accessible by regular users, one must add
+the udev rules file `99-dht22.rules` to the directory `/etc/udev/rules.d/`.
+
+A succesul read from the `/dev/dht22` device returns three comma-separated
+numbers: the timestamp of the most recent successful sensor read, the relative
+humidity as a percentage, and the temperature in degrees Celcius. If the
+read fails, an error is returned.
 
 ```
 */10 * * * * cat /dev/dht22 >> /home/pi/data.csv
@@ -49,17 +53,11 @@ sudo rmmod dht22.ko
 ## Implementation
 
 The module reads data from the sensor when the user opens the `/dev/dht22`
-device. To have the device accessible by regular users, one must add the udev
-rules file `99-dht22.rules` to the directory `/etc/udev/rules.d/`.
-
-Since the sensor, as per the datasheet, can only be read once every two seconds
-the kernel module returns -EBUSY if the user attempts to read the sensor too
-soon. If the sensor read fails for some reason—usually due to the checksum
-validation not passing—the kernel module returns -EIO.
-
-A succesul read from the `/dev/dht22` device returns three comma-separated
-numbers: the timestamp of the most recent successful sensor read, the relative
-humidity as a percentage, and the temperature in degrees Celcius.
+device. Since the sensor, as per the datasheet, can only be read once every
+two seconds the kernel module returns -EBUSY if the user attempts to read the
+sensor too soon after the previous read. If the sensor read fails for some
+reason—usually due to the checksum validation not passing—the kernel module
+returns -EIO.
 
 The protocol for starting a sensor read is to first pull the GPIO pin low for
 at least 1ms and then pull the pin high and wait for the sensor to respond with
