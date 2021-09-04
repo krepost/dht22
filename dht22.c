@@ -56,6 +56,11 @@ module_param(initial_delay_sec, int, S_IRUSR | S_IRGRP | S_IROTH);
 MODULE_PARM_DESC(initial_delay_sec, "Time before first sensor read");
 
 /*
+ * sensor_irq stores the interrupt used to read the sensor.
+ */
+static int sensor_irq;
+
+/*
  * struct dht22_state - All relevant sensor state.
  * @irq: Interrupt used to detect falling edge on sensor GPIO pin.
  * @num_edges: Number of detected edges during a sensor read.
@@ -67,8 +72,6 @@ MODULE_PARM_DESC(initial_delay_sec, "Time before first sensor read");
  * @humidity: Most recently read humidity percentage (times ten).
  */
 struct dht22_state {
-	int irq;
-
 	int num_edges;
 	/*
 	 * timestamps[0] contains the start of the sensor read sequence.
@@ -461,6 +464,7 @@ int __init m_init(void)
 	int error = 0;
 	printk(KERN_INFO DHT22_MODULE_NAME ": hello, world\n");
 
+	sensor_state.read_timestamp = ktime_get();
 	if (read_delay_sec < 3) {
 		printk(KERN_ALERT DHT22_MODULE_NAME
 		       ": read delay less than 3s\n");
@@ -472,30 +476,28 @@ int __init m_init(void)
 	}
 	if (gpio_request(gpiopin, DHT22_MODULE_NAME) < 0) {
 		printk(KERN_ALERT DHT22_MODULE_NAME ": gpio_request failed\n");
-		return -ENODEV;
+		error = -ENXIO;
+		goto gpio_request_failed;
 	}
 	printk(KERN_INFO DHT22_MODULE_NAME ": GPIO pin %d\n", gpiopin);
 	if (gpio_direction_input(gpiopin)) {
 		printk(KERN_ALERT DHT22_MODULE_NAME
 		       ": initial gpio_direction_input failed\n");
-		return -ENODEV;
+		error = -ENXIO;
+		goto gpio_direction_input_failed;
 	}
-	spin_lock(&sensor_lock);
-	sensor_state.read_timestamp = ktime_get();
-	sensor_state.irq = gpio_to_irq(gpiopin);
-	if (sensor_state.irq < 0) {
+	if ((sensor_irq = gpio_to_irq(gpiopin)) < 0) {
 		printk(KERN_ALERT DHT22_MODULE_NAME ": gpio_to_irq failed\n");
-		error = -EBUSY;
+		error = sensor_irq;
 		goto gpio_to_irq_failed;
 	}
-	if (request_irq(sensor_state.irq, s_handle_edge, IRQF_TRIGGER_FALLING,
-			DHT22_MODULE_NAME, NULL) < 0) {
+	if ((error = request_irq(sensor_irq, s_handle_edge,
+				 IRQF_TRIGGER_FALLING, DHT22_MODULE_NAME,
+				 NULL)) < 0) {
 		printk(KERN_ALERT DHT22_MODULE_NAME ": request_irq failed\n");
-		error = -EBUSY;
 		goto request_irq_failed;
 	}
-	printk(KERN_INFO DHT22_MODULE_NAME
-	       ": interrupt %d\n", sensor_state.irq);
+	printk(KERN_INFO DHT22_MODULE_NAME ": interrupt %d\n", sensor_irq);
 
 	if ((error = alloc_chrdev_region(&dht22_dev, 0, DHT22_NUM_DEVICES,
 					 DHT22_DEVICE_NAME)) < 0) {
@@ -527,8 +529,6 @@ int __init m_init(void)
 		error = PTR_ERR(dht22_device);
 		goto device_create_failed;
 	}
-
-	spin_unlock(&sensor_lock);
 	return 0;
 
 device_create_failed:
@@ -538,11 +538,12 @@ class_create_failed:
 cdev_add_failed:
 	unregister_chrdev_region(dht22_dev, DHT22_NUM_DEVICES);
 alloc_chrdev_failed:
-	free_irq(sensor_state.irq, NULL);
+	free_irq(sensor_irq, NULL);
 request_irq_failed:
 gpio_to_irq_failed:
+gpio_direction_input_failed:
 	gpio_free(gpiopin);
-	spin_unlock(&sensor_lock);
+gpio_request_failed:
 	return error;
 }
 
@@ -555,7 +556,7 @@ void __exit m_cleanup(void)
 	class_destroy(dht22_class);
 	cdev_del(&dht22_cdev);
 	unregister_chrdev_region(dht22_dev, DHT22_NUM_DEVICES);
-	free_irq(sensor_state.irq, NULL);
+	free_irq(sensor_irq, NULL);
 	gpio_free(gpiopin);
 	printk(KERN_INFO DHT22_MODULE_NAME ": goodbye, world\n");
 }
