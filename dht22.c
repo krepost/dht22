@@ -365,12 +365,7 @@ static int device_open(struct inode *inode, struct file *filp)
 	print_parsed_debug_info();
 #endif
 	if (error != 0) return error;
-	out = kmalloc(sizeof(struct dht22_output), GFP_KERNEL);
-	if (!out) {
-		printk(KERN_ALERT DHT22_MODULE_NAME
-		       ": no memory for chrdev buffer\n");
-		return -ENOMEM;
-	}
+	/* Read sensor data (protected by sensor_lock) into local variables. */
 	spin_lock_irqsave(&sensor_lock, flags);
 	seconds = sensor_state.read_timespec.tv_sec;
 	hum_int = sensor_state.humidity / 10;
@@ -378,6 +373,13 @@ static int device_open(struct inode *inode, struct file *filp)
 	temp_int = sensor_state.temperature / 10;
 	temp_frac = sensor_state.temperature % 10;
 	spin_unlock_irqrestore(&sensor_lock, flags);
+	/* Sensor lock released. */
+	out = kmalloc(sizeof(struct dht22_output), GFP_KERNEL);
+	if (!out) {
+		printk(KERN_ALERT DHT22_MODULE_NAME
+		       ": no memory for chrdev buffer\n");
+		return -ENOMEM;
+	}
 	printed = snprintf(out->buf, sizeof out->buf, "%lld,%d.%d,%d.%d\n",
 			   seconds, hum_int, hum_frac, temp_int, temp_frac);
 	if(sizeof out->buf <= printed) {
@@ -429,7 +431,10 @@ static ssize_t device_read(struct file *filp, char *user_buffer, size_t len,
 	}
 	while (len && *out->ptr) {
 		/* We use put_user() to copy from kernel data to user data. */
-		put_user(*(out->ptr++), user_buffer++);
+		int error = put_user(*(out->ptr++), user_buffer++);
+		if (error < 0) {
+			return error;
+		}
 		len--;
 		bytes_read++;
 	}
