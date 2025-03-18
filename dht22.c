@@ -83,6 +83,7 @@ struct dht22_state {
 
 	ktime_t read_timestamp;
 	struct timespec64 read_timespec;
+	bool negative;
 	int temperature;
 	int humidity;
 };
@@ -246,10 +247,11 @@ static int try_parse_sensor(void)
 		sensor_state.timestamps[sensor_state.num_edges - 1];
 	sensor_state.humidity =	(sensor_state.bytes[0] * 256 +
 				 sensor_state.bytes[1]);
+	sensor_state.negative = false;
 	sensor_state.temperature = ((sensor_state.bytes[2] & 0x7F) * 256 +
 				    sensor_state.bytes[3]);
 	if (sensor_state.bytes[2] & 0x80) {
-		sensor_state.temperature = -sensor_state.temperature;
+		sensor_state.negative = true;
 	}
 end_try_parse:
 	spin_unlock_irqrestore(&sensor_lock, flags);
@@ -296,25 +298,31 @@ static void print_timing_debug_info(void)
 static void print_parsed_debug_info(void)
 {
 	int hum, temp;
+	char sign[2];
 	u8 sum, *b;
 	unsigned long flags;
+
+	sign[0] = '\0';
+	sign[1] = '\0';
 	spin_lock_irqsave(&sensor_lock, flags);
 	b = sensor_state.bytes;
 	printk(KERN_DEBUG DHT22_MODULE_NAME ": read bytes %*phC\n", 5, b);
 	sum = b[0] + b[1] + b[2] + b[3];
 	hum = b[0] * 256 + b[1];
 	temp = (b[2] & 0x7F) * 256 + b[3];
-	if (b[2] & 0x80) temp = -temp;
+	if (b[2] & 0x80) {
+		sign[0] = '-';
+	}
 	if (sum != b[4]) {
 		printk(KERN_DEBUG DHT22_MODULE_NAME
 		       ": checksum NOT ok: %x != %x\n", sum, b[4]);
 		return;
 	}
 	printk(KERN_DEBUG DHT22_MODULE_NAME ": checksum ok\n");
-	printk(KERN_DEBUG DHT22_MODULE_NAME ": humidity%3d.%d%%\n",
+	printk(KERN_DEBUG DHT22_MODULE_NAME ": humidity %3d.%d%%\n",
 	       hum / 10, hum % 10);
-	printk(KERN_DEBUG DHT22_MODULE_NAME ": temperature%3d.%d°C\n",
-	       temp / 10, temp % 10);
+	printk(KERN_DEBUG DHT22_MODULE_NAME ": temperature %s%3d.%d°C\n",
+	       sign, temp / 10, temp % 10);
 	spin_unlock_irqrestore(&sensor_lock, flags);
 }
 #endif
@@ -353,6 +361,7 @@ static int device_open(struct inode *inode, struct file *filp)
 	struct dht22_output* out;
 	time64_t seconds;
 	int hum_int, hum_frac, temp_int, temp_frac, printed;
+	char sign[2];
 	unsigned long flags;
 	int error = try_read_sensor();
 	if (error != 0) return error;
@@ -365,6 +374,8 @@ static int device_open(struct inode *inode, struct file *filp)
 	print_parsed_debug_info();
 #endif
 	if (error != 0) return error;
+	sign[0] = '\0';
+	sign[1] = '\0';
 	/* Read sensor data (protected by sensor_lock) into local variables. */
 	spin_lock_irqsave(&sensor_lock, flags);
 	seconds = sensor_state.read_timespec.tv_sec;
@@ -372,6 +383,9 @@ static int device_open(struct inode *inode, struct file *filp)
 	hum_frac = sensor_state.humidity % 10;
 	temp_int = sensor_state.temperature / 10;
 	temp_frac = sensor_state.temperature % 10;
+	if (sensor_state.negative) {
+		sign[0] = '-';
+	}
 	spin_unlock_irqrestore(&sensor_lock, flags);
 	/* Sensor lock released. */
 	out = kmalloc(sizeof(struct dht22_output), GFP_KERNEL);
@@ -380,8 +394,8 @@ static int device_open(struct inode *inode, struct file *filp)
 		       ": no memory for chrdev buffer\n");
 		return -ENOMEM;
 	}
-	printed = snprintf(out->buf, sizeof out->buf, "%lld,%d.%d,%d.%d\n",
-			   seconds, hum_int, hum_frac, temp_int, temp_frac);
+	printed = snprintf(out->buf, sizeof out->buf, "%lld,%d.%d,%s%d.%d\n",
+			   seconds, hum_int, hum_frac, sign, temp_int, temp_frac);
 	if(sizeof out->buf <= printed) {
 		kfree(out);
 		printk(KERN_ALERT DHT22_MODULE_NAME
